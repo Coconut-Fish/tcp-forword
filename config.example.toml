@@ -1,0 +1,28 @@
+# tcp-forward 示例配置文件。
+# 可以这样启动：
+#   cargo run -- --config ./config.example.toml
+#
+# 如果同时提供了命令行参数和配置文件，命令行参数会覆盖这里的值。
+
+# 转发器对下游 TCP 客户端监听的地址。
+listen = "0.0.0.0:7001"
+
+# 上游工控程序的 TCP 服务地址。
+upstream = "127.0.0.1:9001"
+
+# 断线重连退避参数，单位为毫秒。
+reconnect_initial_ms = 500
+reconnect_max_ms = 10000
+
+# 每次连接上游时的超时时间，单位为毫秒。
+connect_timeout_ms = 3000
+
+# 客户端发往上游时，内部排队消息的最大数量。
+queue_capacity = 256
+
+# 可选值：trace、debug、info、warn、error
+log_level = "info"
+
+# 说明：
+# 当前重连倍率在代码中固定为 2，
+# 暂时还不能通过 TOML 或 CLI 配置。
