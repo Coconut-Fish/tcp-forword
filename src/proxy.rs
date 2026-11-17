@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
-    sync::mpsc,
+    sync::mpsc::{self, error::TrySendError},
 };
 use tracing::{debug, info, warn};
 
@@ -70,12 +70,17 @@ impl ClientRegistry {
         for (client_id, sender) in snapshot {
             match sender.try_send(data.to_vec()) {
                 Ok(()) => delivered += 1,
-                Err(error) => {
+                Err(TrySendError::Closed(_)) => {
                     stale.push(client_id);
                     debug!(
                         client_id,
-                        reason = ?error,
-                        "dropping client from broadcast registry after send failure"
+                        "dropping client from broadcast registry after client channel closed"
+                    );
+                }
+                Err(TrySendError::Full(_)) => {
+                    debug!(
+                        client_id,
+                        "skipping broadcast for backpressured client because its queue is full"
                     );
                 }
             }
@@ -109,7 +114,7 @@ pub async fn run(config: Config) -> Result<()> {
         reconnect_initial_ms = config.reconnect_initial.as_millis() as u64,
         reconnect_max_ms = config.reconnect_max.as_millis() as u64,
         queue_capacity = config.queue_capacity,
-        "tcp forwarder started"
+        "tcp 转发器启动"
     );
 
     let upstream_handle = tokio::spawn(run_connection_manager(
@@ -124,12 +129,13 @@ pub async fn run(config: Config) -> Result<()> {
         let clients = clients.clone();
         let upstream = upstream.clone();
 
-        info!(client_id, peer_addr = %peer_addr, "client connected");
+        info!(client_id, peer_addr = %peer_addr, "client 连接");
 
+        // 这里不直接 .await 处理连接，而是放到一个独立的任务里，确保即使某个连接处理逻辑出现问题也不会影响其他连接和上游管理器。
         tokio::spawn(async move {
             if let Err(error) = handle_client(client_id, peer_addr, stream, upstream, clients).await
             {
-                warn!(client_id, peer_addr = %peer_addr, error = %error, "client task ended with error");
+                warn!(client_id, peer_addr = %peer_addr, error = %error, "client 连接处理失败");
             }
         });
 
@@ -201,6 +207,7 @@ async fn client_read_loop(
             return Ok(());
         }
 
+        // debug!(client_id, bytes_read, "收到客户端数据: {bytes_read} 字节");
         total_bytes = total_bytes.saturating_add(bytes_read as u64);
         debug!(
             client_id,
@@ -227,6 +234,12 @@ async fn forward_pending(
             {
                 Ok(()) => return None,
                 Err(error) => {
+                    debug!(
+                        client_id,
+                        bytes = error.0.data.len(),
+                        error = %error,
+                        "failed to send payload upstream, will retry after reconnect"
+                    );
                     payload = error.0.data;
                 }
             }
@@ -244,6 +257,12 @@ async fn client_write_loop(
     let mut total_bytes = 0_u64;
 
     while let Some(payload) = receiver.recv().await {
+        debug!(
+            client_id,
+            bytes = payload.len(),
+            payload = ?payload,
+            "received upstream payload for client"
+        );
         writer.write_all(&payload).await?;
         total_bytes = total_bytes.saturating_add(payload.len() as u64);
         debug!(
@@ -255,4 +274,44 @@ async fn client_write_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn keeps_client_registered_when_broadcast_queue_is_temporarily_full() {
+        let registry = ClientRegistry::new();
+        let (sender, mut receiver) = mpsc::channel(1);
+        registry.insert(7, sender);
+
+        let first = registry.broadcast(b"one");
+        assert_eq!(
+            first,
+            BroadcastReport {
+                delivered: 1,
+                dropped: 0
+            }
+        );
+
+        let second = registry.broadcast(b"two");
+        assert_eq!(second.delivered, 0);
+        assert_eq!(second.dropped, 0);
+
+        let queued = receiver.recv().await.expect("first payload queued");
+        assert_eq!(queued, b"one");
+
+        let third = registry.broadcast(b"three");
+        assert_eq!(
+            third,
+            BroadcastReport {
+                delivered: 1,
+                dropped: 0
+            }
+        );
+
+        let resumed = receiver.recv().await.expect("client still registered");
+        assert_eq!(resumed, b"three");
+    }
 }

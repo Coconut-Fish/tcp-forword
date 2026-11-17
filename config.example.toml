@@ -8,7 +8,7 @@
 listen = "0.0.0.0:7001"
 
 # 上游工控程序的 TCP 服务地址。
-upstream = "127.0.0.1:9001"
+upstream = "127.0.0.1:9000"
 
 # 断线重连退避参数，单位为毫秒。
 reconnect_initial_ms = 500
@@ -21,7 +21,7 @@ connect_timeout_ms = 3000
 queue_capacity = 256
 
 # 可选值：trace、debug、info、warn、error
-log_level = "info"
+log_level = "debug"
 
 # 说明：
 # 当前重连倍率在代码中固定为 2，

@@ -90,10 +90,22 @@ cargo build
 cargo build --release
 ```
 
+### Linux ARM64 发布构建
+
+如果需要在 Windows 主机上交叉编译 Linux ARM64，可执行：
+
+```powershell
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+```
+
+当前仓库已为 `aarch64-unknown-linux-musl` 配置 `rust-lld`，因此不需要额外安装 Linux ARM64 的 `gcc` 交叉链接器。
+
 生成的可执行文件位于：
 
 - 开发版：`target\debug\`
 - 发布版：`target\release\`
+- Linux ARM64 发布版：`target\aarch64-unknown-linux-musl\release\`
 
 ## 使用的语言与技术
 

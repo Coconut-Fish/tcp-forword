@@ -125,6 +125,50 @@ async fn broadcasts_upstream_payload_to_all_clients() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn newly_connected_client_receives_upstream_payload_without_sending() -> Result<()> {
+    with_proxy(|listen, upstream| async move {
+        let upstream_listener = TcpListener::bind(upstream).await?;
+        let proxy_handle = spawn_proxy(listen, upstream).await?;
+        let (mut upstream_stream, _) = accept_upstream(&upstream_listener).await?;
+
+        let mut client = wait_for_connect(listen).await?;
+
+        upstream_stream.write_all(b"hello").await?;
+
+        let received = read_exact_len(&mut client, 5).await?;
+        assert_eq!(received, b"hello");
+
+        proxy_handle.abort();
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_reading_client_does_not_block_broadcasts_to_other_clients() -> Result<()> {
+    with_proxy(|listen, upstream| async move {
+        let upstream_listener = TcpListener::bind(upstream).await?;
+        let proxy_handle = spawn_proxy(listen, upstream).await?;
+        let (mut upstream_stream, _) = accept_upstream(&upstream_listener).await?;
+
+        let stalled_client = wait_for_connect(listen).await?;
+        let mut active_client = wait_for_connect(listen).await?;
+
+        for _ in 0..40 {
+            upstream_stream.write_all(b"x").await?;
+        }
+
+        let received = read_exact_len(&mut active_client, 40).await?;
+        assert_eq!(received, b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+
+        drop(stalled_client);
+        proxy_handle.abort();
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnects_upstream_without_dropping_existing_clients() -> Result<()> {
     with_proxy(|listen, upstream| async move {
         let upstream_listener = TcpListener::bind(upstream).await?;

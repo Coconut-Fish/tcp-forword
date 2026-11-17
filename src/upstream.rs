@@ -224,6 +224,12 @@ async fn run_upstream_session(
             }
 
             total_bytes = total_bytes.saturating_add(read as u64);
+            debug!(
+                bytes = read,
+                payload = ?&buffer[..read],
+                total_bytes,
+                "从上游接收数据"
+            );
             let delivered = clients.broadcast(&buffer[..read]);
             debug!(
                 bytes = read,
