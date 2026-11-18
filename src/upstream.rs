@@ -193,7 +193,10 @@ pub async fn run_connection_manager(
 
 async fn connect_upstream(config: &Config) -> Result<TcpStream> {
     match time::timeout(config.connect_timeout, TcpStream::connect(&config.upstream)).await {
-        Ok(Ok(stream)) => Ok(stream),
+        Ok(Ok(stream)) => {
+            stream.set_nodelay(true)?;
+            Ok(stream)
+        }
         Ok(Err(error)) => Err(error.into()),
         Err(_) => Err(anyhow!(
             "timed out after {} ms while connecting",
@@ -235,7 +238,11 @@ async fn run_upstream_session(
         }
     });
 
-    let writer_handle = tokio::spawn(write_upstream_loop(receiver, writer));
+    let writer_handle = tokio::spawn(write_upstream_loop(
+        receiver,
+        writer,
+        config.forward_interval,
+    ));
 
     let outcome = tokio::select! {
         result = reader_handle => join_result("upstream reader", result),
@@ -250,16 +257,23 @@ async fn run_upstream_session(
 async fn write_upstream_loop(
     mut receiver: mpsc::Receiver<UpstreamMessage>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
+    interval: Duration,
 ) -> Result<()> {
     let mut total_bytes = 0_u64;
+    let mut next_send = time::Instant::now();
 
     while let Some(message) = receiver.recv().await {
+        time::sleep_until(next_send).await;
+
         writer.write_all(&message.data).await?;
+        next_send = time::Instant::now() + interval;
+
         total_bytes = total_bytes.saturating_add(message.data.len() as u64);
         debug!(
             client_id = message.client_id,
             bytes = message.data.len(),
             total_bytes,
+            interval_ms = interval.as_millis() as u64,
             "forwarded client payload to upstream"
         );
     }

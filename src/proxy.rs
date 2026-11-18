@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
-    sync::mpsc,
+    sync::mpsc::{self, error::TrySendError},
 };
 use tracing::{debug, info, warn};
 
@@ -70,12 +70,17 @@ impl ClientRegistry {
         for (client_id, sender) in snapshot {
             match sender.try_send(data.to_vec()) {
                 Ok(()) => delivered += 1,
-                Err(error) => {
+                Err(TrySendError::Closed(_)) => {
                     stale.push(client_id);
                     debug!(
                         client_id,
-                        reason = ?error,
-                        "dropping client from broadcast registry after send failure"
+                        "dropping client from broadcast registry after client channel closed"
+                    );
+                }
+                Err(TrySendError::Full(_)) => {
+                    debug!(
+                        client_id,
+                        "skipping broadcast for slow client because its queue is full"
                     );
                 }
             }
@@ -109,6 +114,7 @@ pub async fn run(config: Config) -> Result<()> {
         reconnect_initial_ms = config.reconnect_initial.as_millis() as u64,
         reconnect_max_ms = config.reconnect_max.as_millis() as u64,
         queue_capacity = config.queue_capacity,
+        forward_interval_ms = config.forward_interval.as_millis() as u64,
         "tcp forwarder started"
     );
 
@@ -186,15 +192,9 @@ async fn client_read_loop(
     upstream: UpstreamState,
 ) -> Result<()> {
     let mut buffer = vec![0_u8; 4096];
-    let mut pending: Option<Vec<u8>> = None;
     let mut total_bytes = 0_u64;
 
     loop {
-        if let Some(message) = pending.take() {
-            pending = forward_pending(client_id, message, &upstream).await;
-            continue;
-        }
-
         upstream.wait_until_connected().await;
         let bytes_read = reader.read(&mut buffer).await?;
         if bytes_read == 0 {
@@ -207,27 +207,22 @@ async fn client_read_loop(
             bytes_read, total_bytes, "received client payload"
         );
 
-        pending = Some(buffer[..bytes_read].to_vec());
+        forward_packet(client_id, buffer[..bytes_read].to_vec(), &upstream).await;
     }
 }
 
-async fn forward_pending(
-    client_id: u64,
-    mut payload: Vec<u8>,
-    upstream: &UpstreamState,
-) -> Option<Vec<u8>> {
+async fn forward_packet(client_id: u64, mut data: Vec<u8>, upstream: &UpstreamState) {
     loop {
         if let Some(sender) = upstream.current_sender() {
-            match sender
-                .send(UpstreamMessage {
-                    client_id,
-                    data: payload,
-                })
-                .await
-            {
-                Ok(()) => return None,
+            match sender.send(UpstreamMessage { client_id, data }).await {
+                Ok(()) => return,
                 Err(error) => {
-                    payload = error.0.data;
+                    debug!(
+                        client_id,
+                        bytes = error.0.data.len(),
+                        "failed to queue packet upstream, will retry after reconnect"
+                    );
+                    data = error.0.data;
                 }
             }
         }
@@ -255,4 +250,44 @@ async fn client_write_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn keeps_client_registered_when_broadcast_queue_is_full() {
+        let registry = ClientRegistry::new();
+        let (sender, mut receiver) = mpsc::channel(1);
+        registry.insert(7, sender);
+
+        let first = registry.broadcast(b"one");
+        assert_eq!(
+            first,
+            BroadcastReport {
+                delivered: 1,
+                dropped: 0
+            }
+        );
+
+        let second = registry.broadcast(b"two");
+        assert_eq!(second.delivered, 0);
+        assert_eq!(second.dropped, 0);
+
+        let queued = receiver.recv().await.expect("first payload queued");
+        assert_eq!(queued.as_slice(), b"one");
+
+        let third = registry.broadcast(b"three");
+        assert_eq!(
+            third,
+            BroadcastReport {
+                delivered: 1,
+                dropped: 0
+            }
+        );
+
+        let resumed = receiver.recv().await.expect("client still registered");
+        assert_eq!(resumed.as_slice(), b"three");
+    }
 }

@@ -17,6 +17,7 @@ const DEFAULT_RECONNECT_INITIAL_MS: u64 = 500;
 const DEFAULT_RECONNECT_MAX_MS: u64 = 10_000;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
+const DEFAULT_FORWARD_INTERVAL_MS: u64 = 50;
 const DEFAULT_RECONNECT_MULTIPLIER: u32 = 2;
 
 #[derive(Debug, Clone, Parser)]
@@ -46,6 +47,9 @@ pub struct CliArgs {
 
     #[arg(long)]
     pub queue_capacity: Option<usize>,
+
+    #[arg(long)]
+    pub forward_interval_ms: Option<u64>,
 
     #[arg(long, value_enum)]
     pub log_level: Option<LogLevel>,
@@ -103,6 +107,7 @@ pub struct Config {
     pub reconnect_multiplier: u32,
     pub connect_timeout: Duration,
     pub queue_capacity: usize,
+    pub forward_interval: Duration,
     pub log_level: LogLevel,
 }
 
@@ -116,6 +121,7 @@ impl Default for Config {
             reconnect_multiplier: DEFAULT_RECONNECT_MULTIPLIER,
             connect_timeout: Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS),
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            forward_interval: Duration::from_millis(DEFAULT_FORWARD_INTERVAL_MS),
             log_level: LogLevel::default(),
         }
     }
@@ -129,6 +135,7 @@ struct FileConfig {
     reconnect_max_ms: Option<u64>,
     connect_timeout_ms: Option<u64>,
     queue_capacity: Option<usize>,
+    forward_interval_ms: Option<u64>,
     log_level: Option<LogLevel>,
 }
 
@@ -174,6 +181,9 @@ impl Config {
         if let Some(value) = args.queue_capacity {
             config.queue_capacity = value;
         }
+        if let Some(value) = args.forward_interval_ms {
+            config.forward_interval = Duration::from_millis(value);
+        }
         if let Some(level) = args.log_level {
             config.log_level = level;
         }
@@ -207,6 +217,9 @@ fn apply_file_config(config: &mut Config, file: FileConfig) {
     }
     if let Some(value) = file.queue_capacity {
         config.queue_capacity = value;
+    }
+    if let Some(value) = file.forward_interval_ms {
+        config.forward_interval = Duration::from_millis(value);
     }
     if let Some(level) = file.log_level {
         config.log_level = level;
@@ -276,6 +289,10 @@ mod tests {
             Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS)
         );
         assert_eq!(config.queue_capacity, DEFAULT_QUEUE_CAPACITY);
+        assert_eq!(
+            config.forward_interval,
+            Duration::from_millis(DEFAULT_FORWARD_INTERVAL_MS)
+        );
         assert_eq!(config.log_level, LogLevel::Info);
     }
 
@@ -289,6 +306,7 @@ reconnect_initial_ms = 200
 reconnect_max_ms = 5000
 connect_timeout_ms = 1500
 queue_capacity = 64
+forward_interval_ms = 30
 log_level = "warn"
 "#;
         fs::write(&path, file).expect("writes temp config");
@@ -301,6 +319,8 @@ log_level = "warn"
             "0.0.0.0:7200",
             "--queue-capacity",
             "128",
+            "--forward-interval-ms",
+            "15",
             "--log-level",
             "debug",
         ])
@@ -313,6 +333,7 @@ log_level = "warn"
         assert_eq!(config.reconnect_max, Duration::from_millis(5000));
         assert_eq!(config.connect_timeout, Duration::from_millis(1500));
         assert_eq!(config.queue_capacity, 128);
+        assert_eq!(config.forward_interval, Duration::from_millis(15));
         assert_eq!(config.log_level, LogLevel::Debug);
 
         let _ = fs::remove_file(path);

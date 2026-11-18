@@ -9,6 +9,8 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+const TEST_FORWARD_INTERVAL: Duration = Duration::from_millis(50);
+
 fn test_config(listen: String, upstream: String) -> Config {
     Config {
         listen,
@@ -18,6 +20,7 @@ fn test_config(listen: String, upstream: String) -> Config {
         reconnect_multiplier: 2,
         connect_timeout: Duration::from_millis(200),
         queue_capacity: 32,
+        forward_interval: TEST_FORWARD_INTERVAL,
         log_level: LogLevel::Error,
     }
 }
@@ -29,7 +32,16 @@ fn free_local_addr() -> Result<SocketAddr> {
 }
 
 async fn spawn_proxy(listen: SocketAddr, upstream: SocketAddr) -> Result<JoinHandle<Result<()>>> {
-    let config = test_config(listen.to_string(), upstream.to_string());
+    spawn_proxy_with_interval(listen, upstream, TEST_FORWARD_INTERVAL).await
+}
+
+async fn spawn_proxy_with_interval(
+    listen: SocketAddr,
+    upstream: SocketAddr,
+    forward_interval: Duration,
+) -> Result<JoinHandle<Result<()>>> {
+    let mut config = test_config(listen.to_string(), upstream.to_string());
+    config.forward_interval = forward_interval;
     let handle = tokio::spawn(async move { tcp_forward::run(config).await });
     wait_for_connect(listen).await?;
     Ok(handle)
@@ -110,6 +122,15 @@ async fn broadcasts_upstream_payload_to_all_clients() -> Result<()> {
         let mut client_one = wait_for_connect(listen).await?;
         let mut client_two = wait_for_connect(listen).await?;
 
+        client_one.write_all(b"1").await?;
+        client_two.write_all(b"2").await?;
+        let ready = read_exact_len(&mut upstream_stream, 2).await?;
+        assert!(
+            ready == b"12" || ready == b"21",
+            "unexpected ready payload: {:?}",
+            ready
+        );
+
         upstream_stream.write_all(b"status").await?;
 
         let received_one = read_exact_len(&mut client_one, 6).await?;
@@ -117,6 +138,49 @@ async fn broadcasts_upstream_payload_to_all_clients() -> Result<()> {
 
         assert_eq!(received_one, b"status");
         assert_eq!(received_two, b"status");
+
+        proxy_handle.abort();
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paces_queued_client_messages_to_upstream() -> Result<()> {
+    with_proxy(|listen, upstream| async move {
+        let upstream_listener = TcpListener::bind(upstream).await?;
+        let forward_interval = Duration::from_millis(200);
+        let proxy_handle = spawn_proxy_with_interval(listen, upstream, forward_interval).await?;
+        let (mut upstream_stream, _) = accept_upstream(&upstream_listener).await?;
+
+        let mut client_one = wait_for_connect(listen).await?;
+        let mut client_two = wait_for_connect(listen).await?;
+        client_one.set_nodelay(true)?;
+        client_two.set_nodelay(true)?;
+
+        let start = tokio::time::Instant::now();
+        tokio::try_join!(client_one.write_all(b"aaa"), client_two.write_all(b"bbb"))?;
+
+        let first = read_exact_len(&mut upstream_stream, 3).await?;
+        let first_at = start.elapsed();
+        let second = read_exact_len(&mut upstream_stream, 3).await?;
+        let second_at = start.elapsed();
+
+        let forwarded = [first, second];
+        assert!(
+            (forwarded[0].as_slice() == b"aaa" && forwarded[1].as_slice() == b"bbb")
+                || (forwarded[0].as_slice() == b"bbb" && forwarded[1].as_slice() == b"aaa"),
+            "unexpected upstream payloads: {:?}",
+            forwarded
+        );
+        assert!(
+            first_at < forward_interval,
+            "first message should be forwarded immediately, took {first_at:?}"
+        );
+        assert!(
+            second_at - first_at >= forward_interval.mul_f64(0.7),
+            "queued message was not paced: {first_at:?} -> {second_at:?}"
+        );
 
         proxy_handle.abort();
         Ok(())
